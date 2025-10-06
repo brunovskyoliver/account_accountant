@@ -2,8 +2,25 @@ from odoo import fields, models, Command, tools
 from odoo.tools import SQL
 
 import re
+import logging
 from collections import defaultdict
 from dateutil.relativedelta import relativedelta
+from datetime import datetime
+import os
+
+# Custom logger for reconciliation debugging
+def log_reconciliation(message):
+    """Write reconciliation debug info to a separate log file"""
+    log_file = "/var/log/odoo/odoo_reconciliation_debug.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception as e:
+        pass  # Don't break reconciliation if logging fails
+
+_logger = logging.getLogger(__name__)
 
 
 class AccountReconcileModel(models.Model):
@@ -57,40 +74,61 @@ class AccountReconcileModel(models.Model):
                                 must be applied on the statement line.
             * auto_reconcile:   A flag indicating if the match is enough significant to auto reconcile the candidates.
         '''
+        # TEMPORARY TESTING FILTER - Only process partner ID 1136
+        # if not partner or partner.id != 21:
+        #     return {}
+
+        
+        log_reconciliation("=== RECONCILIATION PROCESS START ===")
+        log_reconciliation(f"Statement Line ID: {st_line.id}, Amount: {st_line.amount}, Payment Ref: '{st_line.payment_ref}', Partner: {partner.name if partner else 'None'} (ID: {partner.id if partner else 'None'})")
+        
         available_models = self.filtered(lambda m: m.rule_type != 'writeoff_button').sorted()
+        log_reconciliation(f"Available reconciliation models: {len(available_models)} - {[m.name for m in available_models]}")
 
         for rec_model in available_models:
+            log_reconciliation(f"--- Checking model: '{rec_model.name}' (type: {rec_model.rule_type}) ---")
 
             if not rec_model._is_applicable_for(st_line, partner):
+                log_reconciliation(f"Model '{rec_model.name}' is NOT applicable for this statement line")
                 continue
 
+            log_reconciliation(f"Model '{rec_model.name}' IS applicable for this statement line")
             if rec_model.rule_type == 'invoice_matching':
                 rules_map = rec_model._get_invoice_matching_rules_map()
+                log_reconciliation(f"Invoice matching rules: {list(rules_map.keys())}")
                 for rule_index in sorted(rules_map.keys()):
                     for rule_method in rules_map[rule_index]:
+                        log_reconciliation(f"Executing rule method: {rule_method.__name__}")
                         candidate_vals = rule_method(st_line, partner)
                         if not candidate_vals:
+                            log_reconciliation(f"Rule method {rule_method.__name__} returned no candidates")
                             continue
 
+                        log_reconciliation(f"Rule method {rule_method.__name__} found candidates: {candidate_vals}")
                         if candidate_vals.get('amls'):
                             res = rec_model._get_invoice_matching_amls_result(st_line, partner, candidate_vals)
                             if res:
+                                log_reconciliation(f"Final result from model '{rec_model.name}': {res}")
                                 return {
                                     **res,
                                     'model': rec_model,
                                 }
                         else:
+                            log_reconciliation(f"Returning candidate_vals directly: {candidate_vals}")
                             return {
                                 **candidate_vals,
                                 'model': rec_model,
                             }
 
             elif rec_model.rule_type == 'writeoff_suggestion':
+                log_reconciliation(f"Returning writeoff suggestion for model '{rec_model.name}'")
                 return {
                     'model': rec_model,
                     'status': 'write_off',
                     'auto_reconcile': rec_model.auto_reconcile,
                 }
+        
+        log_reconciliation("=== NO MATCHES FOUND - RECONCILIATION PROCESS END ===")
         return {}
 
     def _is_applicable_for(self, st_line, partner):
@@ -98,6 +136,18 @@ class AccountReconcileModel(models.Model):
         for the provided statement line and partner.
         """
         self.ensure_one()
+        
+        log_reconciliation(f"Checking applicability for model '{self.name}':")
+        log_reconciliation(f"  - Journal check: model journals {[j.name for j in self.match_journal_ids]} vs st_line journal {st_line.move_id.journal_id.name}")
+        log_reconciliation(f"  - Amount nature: {self.match_nature} vs st_line amount {st_line.amount}")
+        log_reconciliation(f"  - Amount range: {self.match_amount} (min: {self.match_amount_min}, max: {self.match_amount_max}) vs abs amount {abs(st_line.amount)}")
+        log_reconciliation(f"  - Partner check: match_partner={self.match_partner}, partner={partner.name if partner else 'None'}")
+        log_reconciliation(f"  - Statement line partner: {st_line.partner_id.name if st_line.partner_id else 'Not set'}")
+
+        # First check - only process if statement line has partner
+        if not st_line.partner_id:
+            log_reconciliation("  - FAILED: Statement line has no partner set")
+            return False
 
         # Filter on journals, amount nature, amount and partners
         # All the conditions defined in this block are non-match conditions.
@@ -111,29 +161,51 @@ class AccountReconcileModel(models.Model):
             or (self.match_partner and self.match_partner_ids and partner not in self.match_partner_ids)
             or (self.match_partner and self.match_partner_category_ids and not (partner.category_id & self.match_partner_category_ids))
         ):
+            log_reconciliation(f"  - FAILED basic criteria checks")
             return False
 
-        # Filter on label, note and transaction_type
+        # Filter on label, note and transaction_type with improved text matching
         for record, rule_field, record_field in [(st_line, 'label', 'payment_ref'), (st_line.move_id, 'note', 'narration'), (st_line, 'transaction_type', 'transaction_type')]:
-            rule_term = (self['match_' + rule_field + '_param'] or '').lower()
-            record_term = (record[record_field] or '').lower()
+            rule_term = (self['match_' + rule_field + '_param'] or '').strip().lower()
+            record_term = (record[record_field] or '').strip().lower()
+            
+            # Skip empty rules
+            if not rule_term:
+                continue
 
-            # This defines non-match conditions
-            if ((self['match_' + rule_field] == 'contains' and rule_term not in record_term)
-                or (self['match_' + rule_field] == 'not_contains' and rule_term in record_term)
-                or (self['match_' + rule_field] == 'match_regex' and not re.match(rule_term, record_term))
-            ):
-                return False
+            # This defines non-match conditions with improved robustness
+            try:
+                if ((self['match_' + rule_field] == 'contains' and rule_term not in record_term)
+                    or (self['match_' + rule_field] == 'not_contains' and rule_term in record_term)
+                    or (self['match_' + rule_field] == 'match_regex' and not re.match(rule_term, record_term, re.IGNORECASE))
+                ):
+                    return False
+            except re.error:
+                # If regex is invalid, fall back to simple string matching
+                if ((self['match_' + rule_field] == 'contains' and rule_term not in record_term)
+                    or (self['match_' + rule_field] == 'not_contains' and rule_term in record_term)
+                    or (self['match_' + rule_field] == 'match_regex' and rule_term != record_term)
+                ):
+                    return False
 
         return True
 
     def _get_invoice_matching_amls_domain(self, st_line, partner):
+        # Get the basic domain from the statement line
         aml_domain = st_line._get_default_amls_matching_domain()
 
+        # Ensure we only match with 311000 (Customers) and 321000 (Suppliers) accounts
+        # Filter based on account codes
+        allowed_accounts = ('311000', '321000')  # Only allow these account codes
+        aml_domain.append(('account_id.code', 'in', allowed_accounts))
+
+        # Match the correct balance direction
         if st_line.amount > 0.0:
             aml_domain.append(('balance', '>', 0.0))
         else:
             aml_domain.append(('balance', '<', 0.0))
+
+        log_reconciliation(f"Matching only with accounts: {allowed_accounts}")
 
         currency = st_line.foreign_currency_id or st_line.currency_id
         if self.match_same_currency:
@@ -173,39 +245,55 @@ class AccountReconcileModel(models.Model):
                     The second element is a list of tokens you may match exactly.
         """
         st_line_text_values = self._get_st_line_text_values_for_matching(st_line)
+        
         significant_token_size = 4
         numerical_tokens = []
         exact_tokens = set()  # preventing duplicates
         text_tokens = []
+        
         for text_value in st_line_text_values:
-            split_text = (text_value or '').split()
-            # Exact tokens
-            exact_tokens.add(text_value)
+            if not text_value or not text_value.strip():
+                continue
+                
+            # Normalize text: strip whitespace and handle encoding issues
+            text_value = text_value.strip()
+            split_text = text_value.split()
+            
+            # Exact tokens - include full text and significant individual tokens
+            if len(text_value) >= significant_token_size:
+                exact_tokens.add(text_value)
+            
             exact_tokens.update(
-                token for token in split_text
-                if len(token) >= significant_token_size
+                token.strip() for token in split_text
+                if token and len(token.strip()) >= significant_token_size
             )
-            # Text tokens
-            tokens = [
-                ''.join(x for x in token if re.match(r'[0-9a-zA-Z\s]', x))
-                for token in split_text
-            ]
+            
+            # Text tokens - clean and normalize
+            tokens = []
+            for token in split_text:
+                if not token:
+                    continue
+                # Remove punctuation but keep alphanumeric chars and spaces
+                cleaned_token = ''.join(x for x in token if re.match(r'[0-9a-zA-ZàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİıĲĳĴĵĶķĸĹĺĻļĽľĿŀŁłŃńŅņŇňŉŊŋŌōŎŏŐőŒœŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽž\s]', x))
+                if cleaned_token:
+                    tokens.append(cleaned_token.strip())
 
-            # Numerical tokens
+            # Process all tokens
             for token in tokens:
-                # The token is too short to be significant.
                 if len(token) < significant_token_size:
                     continue
-
+                    
                 text_tokens.append(token)
 
+                # Extract numerical parts for numerical matching
                 formatted_token = ''.join(x for x in token if x.isdecimal())
+                if len(formatted_token) >= significant_token_size:
+                    numerical_tokens.append(formatted_token)
 
-                # The token is too short after formatting to be significant.
-                if len(formatted_token) < significant_token_size:
-                    continue
-
-                numerical_tokens.append(formatted_token)
+        # Remove empty tokens and duplicates while preserving order for numerical tokens
+        numerical_tokens = list(dict.fromkeys(token for token in numerical_tokens if token))
+        exact_tokens = {token for token in exact_tokens if token and token.strip()}
+        text_tokens = list(dict.fromkeys(token for token in text_tokens if token))
 
         return numerical_tokens, list(exact_tokens), text_tokens
 
@@ -223,10 +311,15 @@ class AccountReconcileModel(models.Model):
             )
 
         assert self.rule_type == 'invoice_matching'
+        log_reconciliation(f"Starting _get_invoice_matching_amls_candidates for partner {partner.name if partner else 'None'}")
+        log_reconciliation(f"Model text matching settings: label={self.match_text_location_label}, note={self.match_text_location_note}, reference={self.match_text_location_reference}")
+        
         self.env['account.move'].flush_model()
         self.env['account.move.line'].flush_model()
 
         aml_domain = self._get_invoice_matching_amls_domain(st_line, partner)
+        log_reconciliation(f"AML domain: {aml_domain}")
+        
         query = self.env['account.move.line']._where_calc(aml_domain)
         tables = query.from_clause
         where_clause = query.where_clause or SQL("TRUE")
@@ -260,7 +353,7 @@ class AccountReconcileModel(models.Model):
                         account_move_line_id as id,
                         account_move_line_date as date,
                         account_move_line_date_maturity as date_maturity,
-                        UNNEST(
+                        UPPER(UNNEST(
                             REGEXP_SPLIT_TO_ARRAY(
                                 SUBSTRING(
                                     REGEXP_REPLACE(%(field)s, '[^0-9\s]', '', 'g'),
@@ -268,7 +361,7 @@ class AccountReconcileModel(models.Model):
                                 ),
                                 '\s+'
                             )
-                        ) AS token
+                        )) AS token
                     FROM aml_cte
                     WHERE %(field)s IS NOT NULL
                 ''', field=SQL("%s_%s", SQL(table_alias), SQL(field))))
@@ -283,29 +376,59 @@ class AccountReconcileModel(models.Model):
                         account_move_line_id as id,
                         account_move_line_date as date,
                         account_move_line_date_maturity as date_maturity,
-                        %(field)s AS token
+                        UPPER(%(field)s) AS token
                     FROM aml_cte
                     WHERE %(field)s != ''
                 ''', field=SQL("%s_%s", SQL(table_alias), SQL(field))))
         if sub_queries:
             order_by = get_order_by_clause(prefix=SQL('sub.'))
-            candidate_ids = [r[0] for r in self.env.execute_query(SQL(
-                '''
-                    %s
-                    SELECT
-                        sub.id,
-                        COUNT(*) AS nb_match
-                    FROM (%s) AS sub
-                    WHERE sub.token IN %s
-                    GROUP BY sub.date_maturity, sub.date, sub.id
-                    HAVING COUNT(*) > 0
-                    ORDER BY nb_match DESC, %s
-                ''',
-                aml_cte,
-                SQL(" UNION ALL ").join(sub_queries),
-                tuple(numerical_tokens + exact_tokens),
-                order_by,
-            ))]
+            # Make token matching case-insensitive and handle null values robustly
+            search_tokens = tuple(token.upper().strip() for token in numerical_tokens + exact_tokens if token and token.strip())
+            log_reconciliation(f"Search tokens for SQL query: {search_tokens}")
+            
+            if search_tokens:  # Only execute if we have valid tokens to search for
+                log_reconciliation(f"Executing token-based SQL query with {len(sub_queries)} sub-queries")
+                
+                # DEBUG: Show what tokens exist in the database for this partner
+                debug_tokens = [r for r in self.env.execute_query(SQL(
+                    '''
+                        %s
+                        SELECT DISTINCT
+                            sub.token
+                        FROM (%s) AS sub
+                        WHERE sub.token IS NOT NULL 
+                            AND TRIM(sub.token) != ''
+                        ORDER BY sub.token
+                        LIMIT 20
+                    ''',
+                    aml_cte,
+                    SQL(" UNION ALL ").join(sub_queries),
+                ))]
+                log_reconciliation(f"Available tokens in database (first 20): {[t[0] for t in debug_tokens]}")
+                
+                candidate_ids = [r[0] for r in self.env.execute_query(SQL(
+                    '''
+                        %s
+                        SELECT
+                            sub.id,
+                            COUNT(*) AS nb_match
+                        FROM (%s) AS sub
+                        WHERE sub.token IS NOT NULL 
+                            AND TRIM(sub.token) != ''
+                            AND sub.token IN %s
+                        GROUP BY sub.date_maturity, sub.date, sub.id
+                        HAVING COUNT(*) > 0
+                        ORDER BY nb_match DESC, %s
+                    ''',
+                    aml_cte,
+                    SQL(" UNION ALL ").join(sub_queries),
+                    search_tokens,
+                    order_by,
+                ))]
+                log_reconciliation(f"Token-based query found {len(candidate_ids)} candidates: {candidate_ids}")
+            else:
+                log_reconciliation("No valid search tokens found, skipping token-based query")
+                candidate_ids = []
             if candidate_ids:
                 return {
                     'allow_auto_reconcile': True,
@@ -314,9 +437,14 @@ class AccountReconcileModel(models.Model):
             elif self.match_text_location_label or self.match_text_location_note or self.match_text_location_reference:
                 # In the case any of the Label, Note or Reference matching rule has been toggled, and the query didn't return
                 # any candidates, the model should not try to mount another aml instead.
-                return
+                # MODIFIED: Allow fallback to amount/partner matching for better reconciliation coverage
+                log_reconciliation(f"Text matching enabled (label:{self.match_text_location_label}, note:{self.match_text_location_note}, ref:{self.match_text_location_reference}) but no token matches found - ALLOWING fallback matching")
+                # Don't return early - allow fallback matching to proceed
 
+        # Fallback to amount-based matching when no text matches or no partner
+        log_reconciliation(f"Checking fallback amount-based matching (partner: {partner.name if partner else 'None'})")
         if not partner:
+            log_reconciliation("No partner found, using amount-based matching")
             st_line_currency = st_line.foreign_currency_id or st_line.journal_id.currency_id or st_line.company_currency_id
             if st_line_currency == self.company_id.currency_id:
                 aml_amount_field = SQL('amount_residual')
@@ -324,34 +452,79 @@ class AccountReconcileModel(models.Model):
                 aml_amount_field = SQL('amount_residual_currency')
 
             order_by = get_order_by_clause(prefix=SQL('account_move_line.'))
+            
+            # Try exact amount match first
+            log_reconciliation(f"Searching for amount match: {abs(st_line.amount_residual)} in currency {st_line_currency.name}")
             rows = self.env.execute_query(SQL(
                 '''
-                    SELECT account_move_line.id
+                    SELECT account_move_line.id, ABS(account_move_line.%s) as abs_amount
                     FROM %s
                     WHERE
                         %s
                         AND account_move_line.currency_id = %s
-                        AND ROUND(account_move_line.%s, %s) = ROUND(%s, %s)
+                        AND ROUND(ABS(account_move_line.%s), %s) = ROUND(%s, %s)
                     ORDER BY %s
                 ''',
+                aml_amount_field,
                 tables,
                 where_clause,
                 st_line_currency.id,
                 aml_amount_field,
                 st_line_currency.decimal_places,
-                -st_line.amount_residual,
+                abs(st_line.amount_residual),
                 st_line_currency.decimal_places,
                 order_by,
             ))
             amls = self.env['account.move.line'].browse([row[0] for row in rows])
+            log_reconciliation(f"Amount-based query found {len(amls)} candidates: {[aml.id for aml in amls]}")
         else:
+            # When partner is available, use domain-based search with better ordering
+            log_reconciliation("Partner available, using domain-based search")
             amls = self.env['account.move.line'].search(aml_domain, order=get_order_by_clause().code)
+            log_reconciliation(f"Domain-based search found {len(amls)} candidates: {[aml.id for aml in amls]}")
+            
+            # DEBUG: Show details of found candidates for better understanding
+            if amls:
+                for aml in amls[:5]:  # Show first 5 candidates
+                    log_reconciliation(f"  Candidate AML {aml.id}: name='{aml.name}', move_name='{aml.move_id.name}', ref='{aml.move_id.ref}', amount_residual={aml.amount_residual}")
 
         if amls:
+            # Only proceed with auto-reconciliation if bank statement has partner set
+            if not st_line.partner_id:
+                log_reconciliation("Bank statement line has no partner set - disabling auto-reconcile for safety")
+                return {
+                    'allow_auto_reconcile': False,
+                    'amls': amls,
+                }
+
+            # Check for perfect amount matches within 2% tolerance
+            st_line_amount = abs(st_line.amount)
+            tolerance = 0.02  # 2% tolerance
+            perfect_matches = []
+            
+            for aml in amls:
+                # Double check partner matching
+                if aml.partner_id != st_line.partner_id:
+                    log_reconciliation(f"  Skipping AML {aml.id} - partner mismatch: {aml.partner_id.name} vs {st_line.partner_id.name}")
+                    continue
+                    
+                aml_amount = abs(aml.amount_residual)
+                # Calculate percentage difference
+                if st_line_amount > 0:
+                    diff_percentage = abs(aml_amount - st_line_amount) / st_line_amount
+                    if diff_percentage <= tolerance:
+                        perfect_matches.append(aml)
+                        log_reconciliation(f"  Perfect match within 2% tolerance: AML {aml.id}, amount {aml_amount} vs {st_line_amount}, diff: {diff_percentage:.1%}")
+            
+            allow_auto_reconcile = len(perfect_matches) == 1 and st_line.partner_id
+            log_reconciliation(f"Returning {len(amls)} candidates, perfect matches: {len(perfect_matches)}, auto_reconcile: {allow_auto_reconcile}")
+            
             return {
-                'allow_auto_reconcile': False,
+                'allow_auto_reconcile': allow_auto_reconcile,
                 'amls': amls,
             }
+        else:
+            log_reconciliation("No candidates found in _get_invoice_matching_amls_candidates")
 
     def _get_invoice_matching_rules_map(self):
         """ Get a mapping <priority_order, rule> that could be overridden in others modules.
