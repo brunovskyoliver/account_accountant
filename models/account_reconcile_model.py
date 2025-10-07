@@ -10,6 +10,7 @@ import os
 
 # Custom logger for reconciliation debugging
 def log_reconciliation(message):
+    return
     """Write reconciliation debug info to a separate log file"""
     log_file = "/var/log/odoo/odoo_reconciliation_debug.log"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -142,11 +143,11 @@ class AccountReconcileModel(models.Model):
         log_reconciliation(f"  - Amount nature: {self.match_nature} vs st_line amount {st_line.amount}")
         log_reconciliation(f"  - Amount range: {self.match_amount} (min: {self.match_amount_min}, max: {self.match_amount_max}) vs abs amount {abs(st_line.amount)}")
         log_reconciliation(f"  - Partner check: match_partner={self.match_partner}, partner={partner.name if partner else 'None'}")
-        log_reconciliation(f"  - Statement line partner: {st_line.partner_id.name if st_line.partner_id else 'Not set'}")
+        log_reconciliation(f"  - Partner for matching: {partner.name if partner else 'Not set'}")
 
-        # First check - only process if statement line has partner
-        if not st_line.partner_id:
-            log_reconciliation("  - FAILED: Statement line has no partner set")
+        # First check - only process if we have a partner
+        if not partner:
+            log_reconciliation("  - FAILED: No partner provided for matching")
             return False
 
         # Filter on journals, amount nature, amount and partners
@@ -489,9 +490,9 @@ class AccountReconcileModel(models.Model):
                     log_reconciliation(f"  Candidate AML {aml.id}: name='{aml.name}', move_name='{aml.move_id.name}', ref='{aml.move_id.ref}', amount_residual={aml.amount_residual}")
 
         if amls:
-            # Only proceed with auto-reconciliation if bank statement has partner set
-            if not st_line.partner_id:
-                log_reconciliation("Bank statement line has no partner set - disabling auto-reconcile for safety")
+            # Only proceed with auto-reconciliation if we have a partner
+            if not partner:
+                log_reconciliation("No partner available - disabling auto-reconcile for safety")
                 return {
                     'allow_auto_reconcile': False,
                     'amls': amls,
@@ -501,30 +502,55 @@ class AccountReconcileModel(models.Model):
             st_line_amount = abs(st_line.amount)
             tolerance = 0.02  # 2% tolerance
             perfect_matches = []
-            
+
             for aml in amls:
-                # Double check partner matching
-                if aml.partner_id != st_line.partner_id:
-                    log_reconciliation(f"  Skipping AML {aml.id} - partner mismatch: {aml.partner_id.name} vs {st_line.partner_id.name}")
+                if aml.partner_id != partner:
+                    log_reconciliation(f"  Skipping AML {aml.id} - partner mismatch: {aml.partner_id.name} vs {partner.name}")
                     continue
-                    
+
                 aml_amount = abs(aml.amount_residual)
-                # Calculate percentage difference
-                if st_line_amount > 0:
-                    diff_percentage = abs(aml_amount - st_line_amount) / st_line_amount
-                    if diff_percentage <= tolerance:
-                        perfect_matches.append(aml)
-                        log_reconciliation(f"  Perfect match within 2% tolerance: AML {aml.id}, amount {aml_amount} vs {st_line_amount}, diff: {diff_percentage:.1%}")
-            
-            allow_auto_reconcile = len(perfect_matches) == 1 and st_line.partner_id
-            log_reconciliation(f"Returning {len(amls)} candidates, perfect matches: {len(perfect_matches)}, auto_reconcile: {allow_auto_reconcile}")
-            
+                diff_percentage = abs(aml_amount - st_line_amount) / st_line_amount if st_line_amount else 1.0
+                if diff_percentage <= tolerance:
+                    perfect_matches.append(aml)
+                    log_reconciliation(
+                        f"  Perfect match within 2% tolerance: AML {aml.id}, amount {aml_amount} vs {st_line_amount}, diff: {diff_percentage:.1%}"
+                    )
+
+            has_partner = bool(partner)
+            chosen = None
+
+            if perfect_matches:
+                # Sort primarily by closeness to payment amount,
+                # secondarily by oldest date (ascending)
+                sorted_matches = sorted(
+                    perfect_matches,
+                    key=lambda a: (
+                        abs(abs(a.amount_residual) - st_line_amount),
+                        a.date_maturity or a.date or fields.Date.today()
+                    )
+                )
+                chosen = sorted_matches[0]
+                if len(perfect_matches) > 1:
+                    log_reconciliation(
+                        f"Multiple perfect matches found ({len(perfect_matches)}); "
+                        f"choosing AML {chosen.id} with residual {abs(chosen.amount_residual)} "
+                        f"(closest to {st_line_amount}, oldest date {chosen.date_maturity or chosen.date})"
+                    )
+                amls = self.env['account.move.line'].browse([chosen.id])
+
+            allow_auto_reconcile = bool(chosen) and has_partner and self.auto_reconcile
+            log_reconciliation(
+                f"Returning {len(amls)} candidates, perfect matches: {len(perfect_matches)}, "
+                f"auto_reconcile: {allow_auto_reconcile}"
+            )
+
             return {
                 'allow_auto_reconcile': allow_auto_reconcile,
                 'amls': amls,
             }
-        else:
-            log_reconciliation("No candidates found in _get_invoice_matching_amls_candidates")
+ 
+
+
 
     def _get_invoice_matching_rules_map(self):
         """ Get a mapping <priority_order, rule> that could be overridden in others modules.
@@ -586,7 +612,10 @@ class AccountReconcileModel(models.Model):
             if 'allow_write_off' in status and self.line_ids:
                 result['status'] = 'write_off'
 
-            if 'allow_auto_reconcile' in status and candidate_vals['allow_auto_reconcile'] and self.auto_reconcile:
+            # If allow_auto_reconcile is in status and the candidate is marked for auto reconciliation,
+            # set auto_reconcile to True in the result - self.auto_reconcile check is already handled
+            # in the allow_auto_reconcile setting
+            if 'allow_auto_reconcile' in status and candidate_vals.get('allow_auto_reconcile'):
                 result['auto_reconcile'] = True
 
             return result
@@ -708,9 +737,17 @@ class AccountReconcileModel(models.Model):
             sign * (amls_amount_curr + st_line_amount_curr)
         )
 
-        # The statement line will be fully reconciled.
+        # Check if amounts match exactly or within tolerance
         if st_line_currency.is_zero(amount_curr_after_rec):
             return {'allow_auto_reconcile'}
+            
+        # If we have a single line and the difference is within tolerance, allow auto reconciliation
+        if len(amls_values_list) == 1 and self.payment_tolerance_param:
+            tolerance = self.payment_tolerance_param / 100.0  # Convert percentage to decimal
+            diff_amount = abs(amount_curr_after_rec)
+            base_amount = abs(st_line_amount_curr)
+            if base_amount > 0 and (diff_amount / base_amount) <= tolerance:
+                return {'allow_auto_reconcile'}
 
         # The payment amount is higher than the sum of invoices.
         # In that case, don't check the tolerance and don't try to generate any write-off.
