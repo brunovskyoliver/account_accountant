@@ -244,29 +244,71 @@ class AccountReconcileModel(models.Model):
         :return:    A tuple of list of tokens, each one being a string.
                     The first element is a list of tokens you may match on numerical information.
                     The second element is a list of tokens you may match exactly.
+                    The third element is a list of text tokens for additional context.
         """
         st_line_text_values = self._get_st_line_text_values_for_matching(st_line)
         
-        significant_token_size = 4
+        # We'll focus on extracting FAK and VS patterns with highest priority
         numerical_tokens = []
         exact_tokens = set()  # preventing duplicates
         text_tokens = []
+        reference_patterns = []  # High priority reference patterns (FAK, VS)
         
+        # Regular expression patterns - prioritize invoice reference matching
+        fak_pattern = re.compile(r'(FAK/\d{4}/\d{4,8})', re.IGNORECASE)
+        vs_pattern1 = re.compile(r'/VS(\d{6,9})/', re.IGNORECASE)
+        vs_pattern2 = re.compile(r'VS[^\d]*(\d{6,9})', re.IGNORECASE)
+        
+        # Combine all text values for efficient pattern matching
+        all_text = ' '.join(value for value in st_line_text_values if value)
+        
+        # First, extract FAK/YYYY/NNNNN patterns (highest priority)
+        fak_matches = fak_pattern.findall(all_text)
+        if fak_matches:
+            log_reconciliation(f"Found FAK references in line {st_line.id}: {fak_matches}")
+            reference_patterns.extend(fak_matches)
+            exact_tokens.update(fak_matches)
+            
+            # Special handling - also add stripped FAK numbers without leading zeros
+            for fak in fak_matches:
+                parts = fak.split('/')
+                if len(parts) == 3:
+                    # Convert FAK/2025/00416 to FAK/2025/416 for additional matching
+                    clean_num = parts[2].lstrip('0')
+                    if clean_num != parts[2]:
+                        clean_fak = f"{parts[0]}/{parts[1]}/{clean_num}"
+                        reference_patterns.append(clean_fak)
+                        exact_tokens.add(clean_fak)
+        
+        # Second, extract VS patterns
+        vs_matches1 = vs_pattern1.findall(all_text)  # /VS123456/
+        vs_matches2 = vs_pattern2.findall(all_text)  # VS123456
+        vs_matches = list(set(vs_matches1 + vs_matches2))
+        
+        if vs_matches:
+            log_reconciliation(f"Found VS references in line {st_line.id}: {vs_matches}")
+            reference_patterns.extend(vs_matches)
+            exact_tokens.update(vs_matches)
+            # Also add VS prefix versions
+            for vs in vs_matches:
+                exact_tokens.add(f"VS{vs}")
+                reference_patterns.append(f"VS{vs}")
+                
+        # Process regular tokens only if we didn't find specific references
         for text_value in st_line_text_values:
             if not text_value or not text_value.strip():
                 continue
                 
-            # Normalize text: strip whitespace and handle encoding issues
             text_value = text_value.strip()
             split_text = text_value.split()
             
-            # Exact tokens - include full text and significant individual tokens
-            if len(text_value) >= significant_token_size:
+            # Exact tokens - include full text and individual tokens
+            if text_value:
                 exact_tokens.add(text_value)
             
             exact_tokens.update(
                 token.strip() for token in split_text
-                if token and len(token.strip()) >= significant_token_size
+                if token and token.strip()
             )
             
             # Text tokens - clean and normalize
@@ -275,28 +317,32 @@ class AccountReconcileModel(models.Model):
                 if not token:
                     continue
                 # Remove punctuation but keep alphanumeric chars and spaces
-                cleaned_token = ''.join(x for x in token if re.match(r'[0-9a-zA-ZàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİıĲĳĴĵĶķĸĹĺĻļĽľĿŀŁłŃńŅņŇňŉŊŋŌōŎŏŐőŒœŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽž\s]', x))
+                cleaned_token = ''.join(x for x in token if re.match(r'[0-9a-zA-ZàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİıĲĳĴĵĶķĸĹĺĻļĽľĿŀŁłŃńŅņŇňŉŊŋŌōŎŏŐőŒœŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽž\s\-/]', x))
                 if cleaned_token:
                     tokens.append(cleaned_token.strip())
 
             # Process all tokens
             for token in tokens:
-                if len(token) < significant_token_size:
+                if not token:
                     continue
                     
                 text_tokens.append(token)
 
                 # Extract numerical parts for numerical matching
                 formatted_token = ''.join(x for x in token if x.isdecimal())
-                if len(formatted_token) >= significant_token_size:
+                if formatted_token:
                     numerical_tokens.append(formatted_token)
 
         # Remove empty tokens and duplicates while preserving order for numerical tokens
         numerical_tokens = list(dict.fromkeys(token for token in numerical_tokens if token))
         exact_tokens = {token for token in exact_tokens if token and token.strip()}
         text_tokens = list(dict.fromkeys(token for token in text_tokens if token))
+        
+        # Create a list with references patterns first, then other tokens
+        # This ensures FAK and VS patterns are checked first during matching
+        exact_token_list = reference_patterns + [token for token in exact_tokens if token not in reference_patterns]
 
-        return numerical_tokens, list(exact_tokens), text_tokens
+        return numerical_tokens, exact_token_list, text_tokens
 
     def _get_invoice_matching_amls_candidates(self, st_line, partner):
         """ Returns the match candidates for the 'invoice_matching' rule, with respect to the provided parameters.
@@ -498,47 +544,90 @@ class AccountReconcileModel(models.Model):
                     'amls': amls,
                 }
 
-            # Check for perfect amount matches within 2% tolerance
-            st_line_amount = abs(st_line.amount)
-            tolerance = 0.02  # 2% tolerance
-            perfect_matches = []
+            # First, check for invoice reference number matches in st_line.payment_ref or narration
+            has_invoice_ref_match = False
+            invoice_ref_pattern = re.compile(r'([A-Z]{2,5}/\d{4}/\d{4,8})', re.IGNORECASE)
+            
+            # Extract invoice references from statement line text
+            payment_ref_matches = invoice_ref_pattern.findall(st_line.payment_ref or '')
+            narration_matches = invoice_ref_pattern.findall(st_line.narration or '')
+            
+            # Extract unique invoice reference patterns
+            st_line_invoice_refs = list(set(payment_ref_matches + narration_matches))
+            
+            # Look for matches in AML move references or names
+            invoice_ref_matches = []
+            
+            if st_line_invoice_refs:
+                log_reconciliation(f"Found invoice references in statement line: {st_line_invoice_refs}")
+                for aml in amls:
+                    if aml.partner_id != partner:
+                        log_reconciliation(f"  Skipping AML {aml.id} - partner mismatch: {aml.partner_id.name} vs {partner.name}")
+                        continue
+                    
+                    # Check move references and names
+                    move_ref = aml.move_id.ref or ''
+                    move_name = aml.move_id.name or ''
+                    
+                    for ref in st_line_invoice_refs:
+                        if ref in move_ref or ref in move_name:
+                            invoice_ref_matches.append(aml)
+                            log_reconciliation(f"  Found invoice ref match: AML {aml.id}, reference '{ref}' in move ref/name: '{move_ref}'/''{move_name}'")
+                            break
+            
+            # If we found invoice reference matches, prioritize those
+            if invoice_ref_matches:
+                log_reconciliation(f"Using invoice reference matches: {len(invoice_ref_matches)} found")
+                has_invoice_ref_match = True
+                amls = self.env['account.move.line'].browse([aml.id for aml in invoice_ref_matches])
+                chosen = invoice_ref_matches[0] if invoice_ref_matches else None
+            else:
+                # Fall back to amount-based matching with higher tolerance (5%)
+                log_reconciliation(f"No invoice reference matches found, falling back to amount matching")
+                st_line_amount = abs(st_line.amount)
+                tolerance = 0.05  # 5% tolerance (increased from 2%)
+                perfect_matches = []
 
-            for aml in amls:
-                if aml.partner_id != partner:
-                    log_reconciliation(f"  Skipping AML {aml.id} - partner mismatch: {aml.partner_id.name} vs {partner.name}")
-                    continue
+                for aml in amls:
+                    if aml.partner_id != partner:
+                        log_reconciliation(f"  Skipping AML {aml.id} - partner mismatch: {aml.partner_id.name} vs {partner.name}")
+                        continue
 
-                aml_amount = abs(aml.amount_residual)
-                diff_percentage = abs(aml_amount - st_line_amount) / st_line_amount if st_line_amount else 1.0
-                if diff_percentage <= tolerance:
-                    perfect_matches.append(aml)
-                    log_reconciliation(
-                        f"  Perfect match within 2% tolerance: AML {aml.id}, amount {aml_amount} vs {st_line_amount}, diff: {diff_percentage:.1%}"
+                    aml_amount = abs(aml.amount_residual)
+                    diff_percentage = abs(aml_amount - st_line_amount) / st_line_amount if st_line_amount else 1.0
+                    if diff_percentage <= tolerance:
+                        perfect_matches.append(aml)
+                        log_reconciliation(
+                            f"  Perfect match within {tolerance*100}% tolerance: AML {aml.id}, amount {aml_amount} vs {st_line_amount}, diff: {diff_percentage:.1%}"
+                        )
+
+                if perfect_matches:
+                    # Sort primarily by closeness to payment amount,
+                    # secondarily by oldest date (ascending)
+                    sorted_matches = sorted(
+                        perfect_matches,
+                        key=lambda a: (
+                            abs(abs(a.amount_residual) - st_line_amount),
+                            a.date_maturity or a.date or fields.Date.today()
+                        )
                     )
+                    chosen = sorted_matches[0]
+                    if len(perfect_matches) > 1:
+                        log_reconciliation(
+                            f"Multiple perfect matches found ({len(perfect_matches)}); "
+                            f"choosing AML {chosen.id} with residual {abs(chosen.amount_residual)} "
+                            f"(closest to {st_line_amount}, oldest date {chosen.date_maturity or chosen.date})"
+                        )
+                    amls = self.env['account.move.line'].browse([chosen.id])
 
             has_partner = bool(partner)
-            chosen = None
-
-            if perfect_matches:
-                # Sort primarily by closeness to payment amount,
-                # secondarily by oldest date (ascending)
-                sorted_matches = sorted(
-                    perfect_matches,
-                    key=lambda a: (
-                        abs(abs(a.amount_residual) - st_line_amount),
-                        a.date_maturity or a.date or fields.Date.today()
-                    )
-                )
-                chosen = sorted_matches[0]
-                if len(perfect_matches) > 1:
-                    log_reconciliation(
-                        f"Multiple perfect matches found ({len(perfect_matches)}); "
-                        f"choosing AML {chosen.id} with residual {abs(chosen.amount_residual)} "
-                        f"(closest to {st_line_amount}, oldest date {chosen.date_maturity or chosen.date})"
-                    )
-                amls = self.env['account.move.line'].browse([chosen.id])
-
-            allow_auto_reconcile = bool(chosen) and has_partner and self.auto_reconcile
+            # Initialize variables to ensure they always exist
+            chosen = chosen if 'chosen' in locals() else None
+            has_invoice_ref_match = has_invoice_ref_match if 'has_invoice_ref_match' in locals() else False
+            perfect_matches = perfect_matches if 'perfect_matches' in locals() else []
+            
+            # Auto-reconcile if we have an invoice reference match or a close amount match
+            allow_auto_reconcile = (bool(chosen) or has_invoice_ref_match) and has_partner and self.auto_reconcile
             log_reconciliation(
                 f"Returning {len(amls)} candidates, perfect matches: {len(perfect_matches)}, "
                 f"auto_reconcile: {allow_auto_reconcile}"
@@ -561,8 +650,101 @@ class AccountReconcileModel(models.Model):
             * rule:             Method taking <st_line, partner> as parameters and returning the candidates journal items found.
         """
         rules_map = defaultdict(list)
+        
+        # First try to match based on invoice reference patterns
+        rules_map[5].append(self._get_invoice_ref_matching_candidates)
+        
+        # Then fall back to regular matching
         rules_map[10].append(self._get_invoice_matching_amls_candidates)
         return rules_map
+        
+    def _get_invoice_ref_matching_candidates(self, st_line, partner):
+        """Try to match statement lines with invoices based on reference patterns like FAK/YYYY/NNNNN,
+        or variable_code (like 202500403 or VS202500403)
+        
+        :param st_line: A statement line.
+        :param partner: The partner to consider.
+        :return: A dict containing the candidates.
+        """
+        from odoo.tools import html2plaintext
+        
+        # We'll try to match even without a partner if we find specific references
+        partner_required = partner is not None
+        if not partner:
+            log_reconciliation("No partner for reference matching - will check for FAK/VS references only")
+        
+        # Regular expression patterns for FAK and VS references
+        fak_pattern = re.compile(r'(FAK/\d{4}/\d{4,8})', re.IGNORECASE)
+        vs_pattern1 = re.compile(r'/VS(\d{6,9})/', re.IGNORECASE)
+        vs_pattern2 = re.compile(r'VS[^\d]*(\d{6,9})', re.IGNORECASE)  # VS followed by numbers
+        
+        # Focus primarily on payment_ref field as it's most likely to contain the references
+        payment_ref = st_line.payment_ref or ''
+        narration = html2plaintext(st_line.narration or '')
+        
+        log_reconciliation(f"Checking line {st_line.id} with payment_ref: '{payment_ref}'")
+        
+        # Extract all possible references
+        fak_matches = fak_pattern.findall(payment_ref)
+        vs_matches1 = vs_pattern1.findall(payment_ref)
+        vs_matches2 = vs_pattern2.findall(payment_ref) 
+        vs_matches = list(set(vs_matches1 + vs_matches2))  # Combine and deduplicate
+        
+        # If no matches in payment_ref, check narration as fallback
+        if not (fak_matches or vs_matches):
+            fak_matches = fak_pattern.findall(narration)
+            vs_matches1 = vs_pattern1.findall(narration)
+            vs_matches2 = vs_pattern2.findall(narration)
+            vs_matches = list(set(vs_matches1 + vs_matches2))  # Combine and deduplicate
+        
+        # Create a list of all references to search for
+        all_refs = fak_matches + vs_matches + ['VS' + vs for vs in vs_matches]
+        
+        # For FAK references, also add versions without leading zeros
+        for fak in fak_matches:
+            parts = fak.split('/')
+            if len(parts) == 3:
+                # Convert FAK/2025/00416 to FAK/2025/416 for additional matching
+                clean_num = parts[2].lstrip('0')
+                if clean_num != parts[2]:
+                    all_refs.append(f"{parts[0]}/{parts[1]}/{clean_num}")
+        
+        # Log all found references for debugging
+        if all_refs:
+            log_reconciliation(f"Found reference patterns in statement line {st_line.id}: {all_refs}")
+        
+        # If no reference patterns found, skip this matching method
+        if not all_refs:
+            return {}
+            
+        log_reconciliation(f"Found references in statement line: {all_refs}")
+        
+        # Get all partner's open invoices
+        aml_domain = self._get_invoice_matching_amls_domain(st_line, partner)
+        amls = self.env['account.move.line'].search(aml_domain)
+        
+        # Look for matches in move references or names
+        ref_matches = []
+        
+        for aml in amls:
+            # Check move references and names
+            move_ref = aml.move_id.ref or ''
+            move_name = aml.move_id.name or ''
+            
+            for ref in all_refs:
+                if ref in move_ref or ref in move_name:
+                    ref_matches.append(aml)
+                    log_reconciliation(f"Found reference match: AML {aml.id}, reference '{ref}' in move ref/name: '{move_ref}'/''{move_name}'")
+                    break
+                    
+        if ref_matches:
+            log_reconciliation(f"Reference matching found {len(ref_matches)} matches with zero amount tolerance")
+            return {
+                'allow_auto_reconcile': True,
+                'amls': self.env['account.move.line'].browse([aml.id for aml in ref_matches]),
+            }
+            
+        return {}
 
     def _get_partner_from_mapping(self, st_line):
         """Find partner with mapping defined on model.
@@ -718,7 +900,55 @@ class AccountReconcileModel(models.Model):
             * allow_auto_reconcile: Allow to automatically reconcile entries if 'auto_validate' is enabled.
         """
         self.ensure_one()
-
+        
+        # First check for exact reference matches - bypass amount tolerance check completely
+        # This special logic focuses on FAK and VS patterns with zero tolerance
+        from odoo.tools import html2plaintext
+        
+        # Simplified approach - focus directly on the payment_ref field
+        payment_ref = st_line.payment_ref or ''
+        narration = html2plaintext(st_line.narration or '')
+        all_text = payment_ref + ' ' + narration
+        
+        # Regular expression patterns for FAK and VS references
+        fak_pattern = re.compile(r'(FAK/\d{4}/\d{4,8})', re.IGNORECASE)
+        vs_pattern1 = re.compile(r'/VS(\d{6,9})/', re.IGNORECASE)
+        vs_pattern2 = re.compile(r'VS[^\d]*(\d{6,9})', re.IGNORECASE)  # VS followed by numbers
+        
+        # Extract references
+        fak_matches = fak_pattern.findall(all_text)
+        vs_matches1 = vs_pattern1.findall(all_text)
+        vs_matches2 = vs_pattern2.findall(all_text)
+        vs_matches = list(set(vs_matches1 + vs_matches2))  # Combine and deduplicate
+        
+        # Log what we found
+        if fak_matches:
+            log_reconciliation(f"Found FAK references in statement line {st_line.id}: {fak_matches}")
+        if vs_matches:
+            log_reconciliation(f"Found VS references in statement line {st_line.id}: {vs_matches}")
+        
+        if fak_matches or vs_matches:
+            log_reconciliation(f"Found reference patterns: FAK={fak_matches}, VS={vs_matches}")
+            
+            for aml_values in amls_values_list:
+                aml = aml_values['aml']
+                move_ref = aml.move_id.ref or ''
+                move_name = aml.move_id.name or ''
+                move_text = move_ref + ' ' + move_name
+                
+                # Check for FAK reference matches
+                for ref in fak_matches:
+                    if ref in move_text:
+                        log_reconciliation(f"Exact FAK reference match ({ref}) found in {move_text} - auto-reconciling REGARDLESS of amount")
+                        return {'allow_auto_reconcile'}
+                
+                # Check for VS reference matches
+                for ref in vs_matches:
+                    if ref in move_text:
+                        log_reconciliation(f"Exact VS reference match ({ref}) found in {move_text} - auto-reconciling REGARDLESS of amount")
+                        return {'allow_auto_reconcile'}
+        
+        # If no reference match was found, continue with normal tolerance checking
         if not self.allow_payment_tolerance:
             return {'allow_write_off', 'allow_auto_reconcile'}
 
@@ -740,7 +970,46 @@ class AccountReconcileModel(models.Model):
         # Check if amounts match exactly or within tolerance
         if st_line_currency.is_zero(amount_curr_after_rec):
             return {'allow_auto_reconcile'}
+        
+        # We've already checked for reference matches and used zero tolerance
+        # If we've reached here, there were no exact reference matches
+        # We've already checked for FAK/VS pattern references
+        # Here we continue with the standard payment tolerance check
+        log_reconciliation(f"No exact reference matches found for line {st_line.id}, checking payment tolerance")
+        
+        # If we have any reference in the statement line, check for matches in amls
+        # Create a combined list of FAK and VS references
+        st_line_refs = fak_matches + vs_matches + ['VS' + vs for vs in vs_matches]
+        
+        # Also add versions without leading zeros for FAK references
+        for fak in fak_matches:
+            parts = fak.split('/')
+            if len(parts) == 3:
+                clean_num = parts[2].lstrip('0')
+                if clean_num != parts[2]:
+                    st_line_refs.append(f"{parts[0]}/{parts[1]}/{clean_num}")
+        
+        if st_line_refs and amls_values_list:
+            log_reconciliation(f"Looking for these references in move lines: {st_line_refs}")
             
+            for aml_values in amls_values_list:
+                aml = aml_values['aml']
+                move_ref = aml.move_id.ref or ''
+                move_name = aml.move_id.name or ''
+                move_text = move_ref + ' ' + move_name
+                
+                # Check for exact matches
+                for ref in st_line_refs:
+                    # First check for exact matches
+                    if ref == move_ref or ref == move_name:
+                        log_reconciliation(f"EXACT reference match ({ref}) found in {move_text} - allowing auto reconcile with ZERO tolerance")
+                        return {'allow_auto_reconcile'}
+                    # Then check for contains matches
+                    elif ref in move_ref or ref in move_name:
+                        log_reconciliation(f"Reference match ({ref}) found in {move_text} - allowing auto reconcile with ZERO tolerance")
+                        return {'allow_auto_reconcile'}
+            
+        # If no invoice reference match, fall back to amount tolerance
         # If we have a single line and the difference is within tolerance, allow auto reconciliation
         if len(amls_values_list) == 1 and self.payment_tolerance_param:
             tolerance = self.payment_tolerance_param / 100.0  # Convert percentage to decimal

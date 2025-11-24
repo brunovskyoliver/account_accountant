@@ -1,4 +1,5 @@
 import logging
+import re
 
 from odoo import _, api, fields, models
 from odoo.addons.base.models.res_bank import sanitize_account_number
@@ -232,4 +233,73 @@ class AccountBankStatementLine(models.Model):
         if not allowed_fields or 'ref' in allowed_fields:
             if self.ref:
                 st_line_text_values.append(self.ref)
+                
+        # Use available transaction-related fields
+        transaction_fields = {
+            'unique_import_id': self.unique_import_id or '',
+            'online_transaction_identifier': self.online_transaction_identifier or '',
+            'online_partner_information': self.online_partner_information or '',
+            'payment_reference': self.payment_reference or '',
+            'transaction_type': self.transaction_type or ''
+        }
+        
+        # Add all non-empty transaction field values to search text
+        for field_name, field_value in transaction_fields.items():
+            if field_value and isinstance(field_value, str):
+                st_line_text_values.append(field_value)
+            
+        # Collect all text fields for pattern matching
+        all_fields = [
+            self.payment_ref or '',
+            html2plaintext(self.narration or ''),
+            self.ref or '',
+            self.unique_import_id or '',
+            self.online_transaction_identifier or '',
+            self.online_partner_information or '',
+            self.payment_reference or '',
+        ]
+        all_text = ' '.join(all_fields)
+        
+        # Specific patterns to look for in the narration - looking for raw transaction data format
+        raw_end_to_end_pattern = re.compile(r'end_to_end_id:\s*([^\n\s]+)', re.IGNORECASE)
+        raw_variable_code_pattern = re.compile(r'variable_code:\s*([^\n\s]+)', re.IGNORECASE)
+        
+        # Extract from raw format if present
+        narration_text = html2plaintext(self.narration or '')
+        end_to_end_matches = raw_end_to_end_pattern.findall(narration_text)
+        variable_code_matches = raw_variable_code_pattern.findall(narration_text)
+        
+        # Add these special values with highest priority
+        for match in end_to_end_matches:
+            st_line_text_values.append(match)
+            # Also log
+            logging.info(f"Found end_to_end_id in statement line {self.id}: {match}")
+            
+        for match in variable_code_matches:
+            st_line_text_values.append(match)
+            # Also log
+            logging.info(f"Found variable_code in statement line {self.id}: {match}")
+            
+        # Look for FAK/YYYY/NNNNN pattern in any text
+        fak_pattern = re.compile(r'(FAK/\d{4}/\d{4,6})', re.IGNORECASE)
+        fak_matches = fak_pattern.findall(all_text)
+        for match in fak_matches:
+            st_line_text_values.append(match)
+            # Log for debugging
+            logging.info(f"Found FAK reference in statement line {self.id}: {match}")
+            
+        # Look for VS pattern in any text (both with and without slashes)
+        vs_pattern1 = re.compile(r'/VS(\d{6,9})/', re.IGNORECASE)
+        vs_pattern2 = re.compile(r'VS[^\d]*(\d{6,9})', re.IGNORECASE)  # VS followed by numbers
+        
+        vs_matches1 = vs_pattern1.findall(all_text)
+        vs_matches2 = vs_pattern2.findall(all_text)
+        vs_matches = set(vs_matches1 + vs_matches2)  # Combine and deduplicate
+        
+        for match in vs_matches:
+            st_line_text_values.append(match)
+            st_line_text_values.append(f"VS{match}")
+            # Log for debugging
+            logging.info(f"Found VS reference in statement line {self.id}: {match}")
+        
         return st_line_text_values
