@@ -1176,6 +1176,53 @@ class BankRecWidget(models.Model):
         if self.st_line_id.is_reconciled:
             return
 
+        # Special handling for specific supplier transactions - auto-assign partner
+        partner_to_use = self.partner_id
+        if not partner_to_use and self.st_line_id.amount < 0 and self.st_line_id.payment_ref:
+            payment_ref_lower = self.st_line_id.payment_ref.lower()
+            if 'alza' in payment_ref_lower:
+                alza_partner = self.env['res.partner'].browse(21)
+                if alza_partner.exists():
+                    partner_to_use = alza_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = alza_partner
+            elif 'gamers outlet' in payment_ref_lower or 'gamersoutlet' in payment_ref_lower:
+                gamers_partner = self.env['res.partner'].browse(1688)
+                if gamers_partner.exists():
+                    partner_to_use = gamers_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = gamers_partner
+            elif 'smartstores' in payment_ref_lower or 'smart stores' in payment_ref_lower:
+                smartstores_partner = self.env['res.partner'].browse(1691)
+                if smartstores_partner.exists():
+                    partner_to_use = smartstores_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = smartstores_partner
+            elif 'westech' in payment_ref_lower:
+                westech_partner = self.env['res.partner'].browse(4941)
+                if westech_partner.exists():
+                    partner_to_use = westech_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = westech_partner
+            elif 'tss group' in payment_ref_lower or 'tssgroup' in payment_ref_lower or 'tss-group' in payment_ref_lower:
+                tss_partner = self.env['res.partner'].browse(1661)
+                if tss_partner.exists():
+                    partner_to_use = tss_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = tss_partner
+            elif 'slovak telekom' in payment_ref_lower or 'telekom' in payment_ref_lower:
+                telekom_partner = self.env['res.partner'].browse(1662)
+                if telekom_partner.exists():
+                    partner_to_use = telekom_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = telekom_partner
+            elif 'acs spol' in payment_ref_lower or 'acs s.r.o' in payment_ref_lower or 'acs s r o' in payment_ref_lower:
+                acs_partner = self.env['res.partner'].browse(1660)
+                if acs_partner.exists():
+                    partner_to_use = acs_partner
+                    # Also update the partner on the widget for display
+                    self.partner_id = acs_partner
+
         reconcile_models = self.env['account.reconcile.model'].search([
             ('rule_type', '!=', 'writeoff_button'),
             ('company_id', '=', self.company_id.id),
@@ -1183,7 +1230,7 @@ class BankRecWidget(models.Model):
             ('match_journal_ids', '=', False),
             ('match_journal_ids', '=', self.st_line_id.journal_id.id),
         ])
-        matching = reconcile_models._apply_rules(self.st_line_id, self.partner_id)
+        matching = reconcile_models._apply_rules(self.st_line_id, partner_to_use)
 
         if matching.get('amls'):
             reco_model = matching['model']

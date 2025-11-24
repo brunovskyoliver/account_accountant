@@ -75,10 +75,45 @@ class AccountReconcileModel(models.Model):
                                 must be applied on the statement line.
             * auto_reconcile:   A flag indicating if the match is enough significant to auto reconcile the candidates.
         '''
-        # TEMPORARY TESTING FILTER - Only process partner ID 1136
-        # if not partner or partner.id != 21:
-        #     return {}
-
+        # Special handling for specific supplier transactions (negative amounts)
+        # Automatically set partner based on keywords in payment_ref for supplier invoice matching
+        if not partner and st_line.amount < 0 and st_line.payment_ref:
+            payment_ref_lower = st_line.payment_ref.lower()
+            if 'alza' in payment_ref_lower:
+                alza_partner = self.env['res.partner'].browse(21)
+                if alza_partner.exists():
+                    partner = alza_partner
+                    log_reconciliation(f"Auto-assigned Alza partner (ID: 21) based on payment_ref containing 'alza' with negative amount")
+            elif 'gamers outlet' in payment_ref_lower or 'gamersoutlet' in payment_ref_lower:
+                gamers_partner = self.env['res.partner'].browse(1688)
+                if gamers_partner.exists():
+                    partner = gamers_partner
+                    log_reconciliation(f"Auto-assigned GAMERS OUTLET partner (ID: 1688) based on payment_ref containing 'gamers outlet' with negative amount")
+            elif 'smartstores' in payment_ref_lower or 'smart stores' in payment_ref_lower:
+                smartstores_partner = self.env['res.partner'].browse(1691)
+                if smartstores_partner.exists():
+                    partner = smartstores_partner
+                    log_reconciliation(f"Auto-assigned smartstores.sk partner (ID: 1691) based on payment_ref containing 'smartstores' with negative amount")
+            elif 'westech' in payment_ref_lower:
+                westech_partner = self.env['res.partner'].browse(4941)
+                if westech_partner.exists():
+                    partner = westech_partner
+                    log_reconciliation(f"Auto-assigned WESTech partner (ID: 4941) based on payment_ref containing 'westech' with negative amount")
+            elif 'tss group' in payment_ref_lower or 'tssgroup' in payment_ref_lower or 'tss-group' in payment_ref_lower:
+                tss_partner = self.env['res.partner'].browse(1661)
+                if tss_partner.exists():
+                    partner = tss_partner
+                    log_reconciliation(f"Auto-assigned TSS Group partner (ID: 1661) based on payment_ref containing 'tss group' with negative amount")
+            elif 'slovak telekom' in payment_ref_lower or 'telekom' in payment_ref_lower:
+                telekom_partner = self.env['res.partner'].browse(1662)
+                if telekom_partner.exists():
+                    partner = telekom_partner
+                    log_reconciliation(f"Auto-assigned Slovak Telekom a.s. partner (ID: 1662) based on payment_ref containing 'telekom' with negative amount")
+            elif 'acs spol' in payment_ref_lower or 'acs s.r.o' in payment_ref_lower or 'acs s r o' in payment_ref_lower:
+                acs_partner = self.env['res.partner'].browse(1660)
+                if acs_partner.exists():
+                    partner = acs_partner
+                    log_reconciliation(f"Auto-assigned ACS spol. s r.o partner (ID: 1660) based on payment_ref containing 'acs' with negative amount")
         
         log_reconciliation("=== RECONCILIATION PROCESS START ===")
         log_reconciliation(f"Statement Line ID: {st_line.id}, Amount: {st_line.amount}, Payment Ref: '{st_line.payment_ref}', Partner: {partner.name if partner else 'None'} (ID: {partner.id if partner else 'None'})")
