@@ -10,7 +10,6 @@ import os
 
 # Custom logger for reconciliation debugging
 def log_reconciliation(message):
-    return
     """Write reconciliation debug info to a separate log file"""
     log_file = "/var/log/odoo/odoo_reconciliation_debug.log"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
