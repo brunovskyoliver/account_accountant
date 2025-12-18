@@ -10,6 +10,7 @@ import os
 
 # Custom logger for reconciliation debugging
 def log_reconciliation(message):
+    return
     """Write reconciliation debug info to a separate log file"""
     log_file = "/var/log/odoo/odoo_reconciliation_debug.log"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -113,11 +114,26 @@ class AccountReconcileModel(models.Model):
                 if acs_partner.exists():
                     partner = acs_partner
                     log_reconciliation(f"Auto-assigned ACS spol. s r.o partner (ID: 1660) based on payment_ref containing 'acs' with negative amount")
+            elif 'upc broadband slovakia' in payment_ref_lower or 'upc' in payment_ref_lower:
+                upc_partner = self.env['res.partner'].browse(1648)
+                if upc_partner.exists():
+                    partner = upc_partner
+                    log_reconciliation(f"Auto-assigned UPC Broadband Slovakia partner (ID: 1648) based on payment_ref containing 'upc' with negative amount")
         
         log_reconciliation("=== RECONCILIATION PROCESS START ===")
         log_reconciliation(f"Statement Line ID: {st_line.id}, Amount: {st_line.amount}, Payment Ref: '{st_line.payment_ref}', Partner: {partner.name if partner else 'None'} (ID: {partner.id if partner else 'None'})")
         
-        available_models = self.filtered(lambda m: m.rule_type != 'writeoff_button').sorted()
+        # Sort models: writeoff_suggestion models with text matching come first, then others
+        def model_sort_key(model):
+            # Prioritize writeoff models that have specific text matching
+            if model.rule_type == 'writeoff_suggestion':
+                if model.match_label or model.match_note:
+                    return (0, model.sequence)  # Highest priority
+                return (1, model.sequence)  # Second priority
+            else:
+                return (2, model.sequence)  # Lowest priority (invoice_matching, etc.)
+        
+        available_models = self.filtered(lambda m: m.rule_type != 'writeoff_button').sorted(key=model_sort_key)
         log_reconciliation(f"Available reconciliation models: {len(available_models)} - {[m.name for m in available_models]}")
 
         for rec_model in available_models:
@@ -143,6 +159,20 @@ class AccountReconcileModel(models.Model):
                         if candidate_vals.get('amls'):
                             res = rec_model._get_invoice_matching_amls_result(st_line, partner, candidate_vals)
                             if res:
+                                # Check if this is a poor quality match (huge amount difference)
+                                # If the difference is more than 50% of the statement line amount, skip this match
+                                st_line_amount = abs(st_line.amount)
+                                if res.get('amls'):
+                                    # res['amls'] contains account.move.line recordset objects, not dicts
+                                    total_aml_residual = sum(abs(aml.amount_residual) for aml in res['amls'])
+                                    amount_diff = abs(st_line_amount - total_aml_residual)
+                                    
+                                    if st_line_amount > 0 and (amount_diff / st_line_amount) > 0.5:
+                                        log_reconciliation(f"Skipping poor quality match from '{rec_model.name}': "
+                                                         f"st_line amount {st_line_amount}, total_aml_residual {total_aml_residual}, "
+                                                         f"diff {amount_diff} ({100*amount_diff/st_line_amount:.1f}%)")
+                                        continue  # Skip this poor match and try other models
+                                
                                 log_reconciliation(f"Final result from model '{rec_model.name}': {res}")
                                 return {
                                     **res,
@@ -157,11 +187,19 @@ class AccountReconcileModel(models.Model):
 
             elif rec_model.rule_type == 'writeoff_suggestion':
                 log_reconciliation(f"Returning writeoff suggestion for model '{rec_model.name}'")
-                return {
+                result = {
                     'model': rec_model,
                     'status': 'write_off',
                     'auto_reconcile': rec_model.auto_reconcile,
                 }
+                
+                # Special handling for specific models - remove partner
+                # Models: "Istina" (ID: 13), "Uroky" (ID: 19)
+                if rec_model.name in ['Istina', 'Uroky'] or rec_model.id in [13, 19]:
+                    result['partner'] = None
+                    log_reconciliation(f"Removing partner for '{rec_model.name}' model")
+                
+                return result
         
         log_reconciliation("=== NO MATCHES FOUND - RECONCILIATION PROCESS END ===")
         return {}
@@ -178,20 +216,25 @@ class AccountReconcileModel(models.Model):
         log_reconciliation(f"  - Amount range: {self.match_amount} (min: {self.match_amount_min}, max: {self.match_amount_max}) vs abs amount {abs(st_line.amount)}")
         log_reconciliation(f"  - Partner check: match_partner={self.match_partner}, partner={partner.name if partner else 'None'}")
         log_reconciliation(f"  - Partner for matching: {partner.name if partner else 'Not set'}")
-
-        # First check - only process if we have a partner
-        if not partner:
-            log_reconciliation("  - FAILED: No partner provided for matching")
-            return False
+        
+        # Hardcoded exclusion: "Transak dan" model should not match if "alza" is in the label
+        if self.name == 'Transak dan' or self.id == 18:
+            payment_ref_lower = (st_line.payment_ref or '').lower()
+            if any(term in payment_ref_lower for term in ['alza', 'microsoft', 'cashback']):
+                log_reconciliation(f"  - EXCLUDED: 'Transak dan' model skipped because 'alza' or 'microsoft' found in label")
+                return False
 
         # Filter on journals, amount nature, amount and partners
         # All the conditions defined in this block are non-match conditions.
+        # For 'between' checks with negative ranges, use signed amount instead of abs
+        amount_to_check = st_line.amount if (self.match_amount == 'between' and self.match_amount_min < 0) else abs(st_line.amount)
+        
         if ((self.match_journal_ids and st_line.move_id.journal_id not in self.match_journal_ids)
             or (self.match_nature == 'amount_received' and st_line.amount < 0)
             or (self.match_nature == 'amount_paid' and st_line.amount > 0)
             or (self.match_amount == 'lower' and abs(st_line.amount) >= self.match_amount_max)
             or (self.match_amount == 'greater' and abs(st_line.amount) <= self.match_amount_min)
-            or (self.match_amount == 'between' and (abs(st_line.amount) > self.match_amount_max or abs(st_line.amount) < self.match_amount_min))
+            or (self.match_amount == 'between' and (amount_to_check > self.match_amount_max or amount_to_check < self.match_amount_min))
             or (self.match_partner and not partner)
             or (self.match_partner and self.match_partner_ids and partner not in self.match_partner_ids)
             or (self.match_partner and self.match_partner_category_ids and not (partner.category_id & self.match_partner_category_ids))
@@ -204,6 +247,10 @@ class AccountReconcileModel(models.Model):
             rule_term = (self['match_' + rule_field + '_param'] or '').strip().lower()
             record_term = (record[record_field] or '').strip().lower()
             
+            # Log the matching attempt for debugging
+            if rule_term:
+                log_reconciliation(f"  - Text matching: field={rule_field}, rule_term='{rule_term}', record_term='{record_term[:100]}...', match_type={self['match_' + rule_field]}")
+            
             # Skip empty rules
             if not rule_term:
                 continue
@@ -214,6 +261,7 @@ class AccountReconcileModel(models.Model):
                     or (self['match_' + rule_field] == 'not_contains' and rule_term in record_term)
                     or (self['match_' + rule_field] == 'match_regex' and not re.match(rule_term, record_term, re.IGNORECASE))
                 ):
+                    log_reconciliation(f"  - FAILED text matching for {rule_field}")
                     return False
             except re.error:
                 # If regex is invalid, fall back to simple string matching
@@ -221,6 +269,7 @@ class AccountReconcileModel(models.Model):
                     or (self['match_' + rule_field] == 'not_contains' and rule_term in record_term)
                     or (self['match_' + rule_field] == 'match_regex' and rule_term != record_term)
                 ):
+                    log_reconciliation(f"  - FAILED text matching for {rule_field} (regex error fallback)")
                     return False
 
         return True
@@ -619,7 +668,7 @@ class AccountReconcileModel(models.Model):
                 # Fall back to amount-based matching with higher tolerance (5%)
                 log_reconciliation(f"No invoice reference matches found, falling back to amount matching")
                 st_line_amount = abs(st_line.amount)
-                tolerance = 0.05  # 5% tolerance (increased from 2%)
+                tolerance = 0.0001  # 0.01% tolerance (increased from 2%)
                 perfect_matches = []
 
                 for aml in amls:

@@ -1232,6 +1232,10 @@ class BankRecWidget(models.Model):
         ])
         matching = reconcile_models._apply_rules(self.st_line_id, partner_to_use)
 
+        # Handle partner removal for specific models (like "Istina")
+        if 'partner' in matching and matching['partner'] is None:
+            self.partner_id = False
+            
         if matching.get('amls'):
             reco_model = matching['model']
             # In case there is a write-off, keep the whole amount and let the write-off doing the auto-balancing.
