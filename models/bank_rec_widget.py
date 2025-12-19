@@ -932,6 +932,10 @@ class BankRecWidget(models.Model):
 
     def _lines_prepare_reco_model_write_off_vals(self, reco_model, write_off_vals):
         self.ensure_one()
+        
+        # Safeguard: ensure account_id is present, return empty dict if not
+        if 'account_id' not in write_off_vals or not write_off_vals.get('account_id'):
+            return {}
 
         balance = self.st_line_id\
             ._prepare_counterpart_amounts_using_st_line_rate(self.transaction_currency_id, None, write_off_vals['amount_currency'])['balance']
@@ -1633,10 +1637,13 @@ class BankRecWidget(models.Model):
             self.return_todo_command = clean_action(action, self.env)
         else:
             # Apply the newly generated lines.
-            self.line_ids = [
+            write_off_lines = [
                 Command.create(self._lines_prepare_reco_model_write_off_vals(reco_model, x))
                 for x in write_off_vals_list
             ]
+            # Filter out empty dicts (from skipped lines without account)
+            # Command.create returns (0, 0, {...}), so check if the dict is not empty
+            self.line_ids = [line for line in write_off_lines if line[2]]  # line[2] is the dict part of Command.create
 
             self._lines_recompute_taxes()
             self._lines_add_auto_balance_line()
