@@ -119,6 +119,11 @@ class AccountReconcileModel(models.Model):
                 if upc_partner.exists():
                     partner = upc_partner
                     log_reconciliation(f"Auto-assigned UPC Broadband Slovakia partner (ID: 1648) based on payment_ref containing 'upc' with negative amount")
+            elif 'va-mont' in payment_ref_lower or 'vamont' in payment_ref_lower:
+                vamont_partner = self.env['res.partner'].browse(1179)
+                if vamont_partner.exists():
+                    partner = vamont_partner
+                    log_reconciliation(f"Auto-assigned Va-mont Finance partner (ID: 1179) based on payment_ref containing 'va-mont' with negative amount")
         
         log_reconciliation("=== RECONCILIATION PROCESS START ===")
         log_reconciliation(f"Statement Line ID: {st_line.id}, Amount: {st_line.amount}, Payment Ref: '{st_line.payment_ref}', Partner: {partner.name if partner else 'None'} (ID: {partner.id if partner else 'None'})")
