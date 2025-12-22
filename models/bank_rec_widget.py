@@ -1182,7 +1182,7 @@ class BankRecWidget(models.Model):
 
         # Special handling for specific supplier transactions - auto-assign partner
         partner_to_use = self.partner_id
-        if not partner_to_use and self.st_line_id.amount < 0 and self.st_line_id.payment_ref:
+        if not partner_to_use and self.st_line_id.payment_ref:
             payment_ref_lower = self.st_line_id.payment_ref.lower()
             if 'alza' in payment_ref_lower:
                 alza_partner = self.env['res.partner'].browse(21)

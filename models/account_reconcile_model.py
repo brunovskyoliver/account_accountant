@@ -77,7 +77,7 @@ class AccountReconcileModel(models.Model):
         '''
         # Special handling for specific supplier transactions (negative amounts)
         # Automatically set partner based on keywords in payment_ref for supplier invoice matching
-        if not partner and st_line.amount < 0 and st_line.payment_ref:
+        if not partner and st_line.payment_ref:
             payment_ref_lower = st_line.payment_ref.lower()
             if 'alza' in payment_ref_lower:
                 alza_partner = self.env['res.partner'].browse(21)
