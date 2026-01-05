@@ -130,6 +130,55 @@ class AccountReconcileModel(models.Model):
                     partner = microsoft_partner
                     log_reconciliation(f"Auto-assigned Microsoft partner (ID: 1650) based on payment_ref containing 'microsoft payments' with negative amount")
         
+        # Special handling for VISA card payments (Alza and others) - match by amount and date
+        # Only for supplier payments (negative amounts)
+        if not partner and st_line.payment_ref and st_line.amount < 0:
+            # Check if payment_ref looks like a card payment (contains card pattern)
+            payment_ref_lower = st_line.payment_ref.lower()
+            if re.search(r'\d{4}\s*\d{2}\*+\s*\*+\s*\d{4}', payment_ref_lower):  # Pattern like "4544 17** **** 9376"
+                alza_partner = self.env['res.partner'].browse(21)
+                if alza_partner.exists():
+                    # Try to find matching invoices by amount and date proximity (max 30 days)
+                    st_line_date = st_line.date
+                    st_line_amount = abs(st_line.amount)
+                    
+                    # Find open supplier invoices for Alza within 30 days
+                    matching_invoices = self.env['account.move.line'].search([
+                        ('move_id.partner_id', '=', alza_partner.id),
+                        ('move_id.move_type', '=', 'in_invoice'),
+                        ('move_id.state', '=', 'posted'),
+                        ('account_id.code', '=', '321000'),  # Supplier account
+                        ('amount_residual', '!=', 0),
+                        ('move_id.invoice_date', '>=', st_line_date - relativedelta(days=30)),
+                        ('move_id.invoice_date', '<=', st_line_date + relativedelta(days=30)),
+                    ], limit=10)
+                    
+                    # Find exact match or closest match by amount
+                    exact_match = None
+                    closest_match = None
+                    min_diff = float('inf')
+                    
+                    for invoice_line in matching_invoices:
+                        invoice_residual = abs(invoice_line.amount_residual)
+                        diff = abs(st_line_amount - invoice_residual)
+                        
+                        # Exact or very close match (within 0.01)
+                        if diff < 0.01:
+                            exact_match = invoice_line
+                            break
+                        
+                        # Track closest match
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_match = invoice_line
+                    
+                    if exact_match:
+                        partner = alza_partner
+                        log_reconciliation(f"Auto-assigned Alza partner (ID: 21) based on card payment pattern with exact invoice amount match")
+                    elif closest_match and min_diff < (st_line_amount * 0.1):  # Within 10% tolerance
+                        partner = alza_partner
+                        log_reconciliation(f"Auto-assigned Alza partner (ID: 21) based on card payment pattern with closest invoice amount match (diff: {min_diff})")
+        
         log_reconciliation("=== RECONCILIATION PROCESS START ===")
         log_reconciliation(f"Statement Line ID: {st_line.id}, Amount: {st_line.amount}, Payment Ref: '{st_line.payment_ref}', Partner: {partner.name if partner else 'None'} (ID: {partner.id if partner else 'None'})")
         
