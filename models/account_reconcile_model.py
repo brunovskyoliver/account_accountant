@@ -84,7 +84,7 @@ class AccountReconcileModel(models.Model):
                 if alza_partner.exists():
                     partner = alza_partner
                     log_reconciliation(f"Auto-assigned Alza partner (ID: 21) based on payment_ref containing 'alza' with negative amount")
-            elif 'gamers outlet' in payment_ref_lower or 'gamersoutlet' in payment_ref_lower:
+            elif 'gamers outlet' in payment_ref_lower or 'gamersoutlet' in payment_ref_lower or 'PAYPAL *GAMER OUTLT'.lower() in payment_ref_lower:
                 gamers_partner = self.env['res.partner'].browse(1688)
                 if gamers_partner.exists():
                     partner = gamers_partner
@@ -124,6 +124,11 @@ class AccountReconcileModel(models.Model):
                 if vamont_partner.exists():
                     partner = vamont_partner
                     log_reconciliation(f"Auto-assigned Va-mont Finance partner (ID: 1179) based on payment_ref containing 'va-mont' with negative amount")
+            elif 'microsoft payments' in payment_ref_lower or 'microsoft' in payment_ref_lower:
+                microsoft_partner = self.env['res.partner'].browse(1650)
+                if microsoft_partner.exists():
+                    partner = microsoft_partner
+                    log_reconciliation(f"Auto-assigned Microsoft partner (ID: 1650) based on payment_ref containing 'microsoft payments' with negative amount")
         
         log_reconciliation("=== RECONCILIATION PROCESS START ===")
         log_reconciliation(f"Statement Line ID: {st_line.id}, Amount: {st_line.amount}, Payment Ref: '{st_line.payment_ref}', Partner: {partner.name if partner else 'None'} (ID: {partner.id if partner else 'None'})")
